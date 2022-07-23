@@ -1,69 +1,117 @@
 import boto3
 
-ec2 = boto3.resource('ec2', aws_access_key_id='AWS_ACCESS_KEY_ID',
-                     aws_secret_access_key='AWS_SECRET_ACCESS_KEY',
-                     region_name='us-west-2')
+# Using default config profile
+client = boto3.client('ec2')
 
 # create VPC and assign a name to vpc using tags
-vpc = ec2.create_vpc(CidrBlock='192.168.0.0/16')
-vpc.create_tags(Tags=[{"Key": "Name", "Value": "my_vpc"}])
+vpc = client.create_vpc(CidrBlock='192.168.0.0/16')
+vpc.create_tags(Tags=[{"Key": "Name", 
+                       "Value": "my_vpc"
+                       }]
+                )
 vpc.wait_until_available()
 
-# create and attach internet gateway
-igw = ec2.create_internet_gateway()
-vpc.attach_internet_gateway(InternetGatewayId=igw.id)
-
-# create a route table and a public route
-route_table = vpc.create_route_table()
-route = route_table.create_route(DestinationCidrBlock='0.0.0.0/0', GatewayId=igw.id)
+# create and attach internet gateway to the vpc
+igw = client.create_internet_gateway()
+vpc.attach_internet_gateway(InternetGatewayId=igw['InternetGateway']['InternetGatewayId']) 
 
 # create subnet
-subnet1 = ec2.create_subnet(CidrBlock='192.168.1.0/24', VpcId=vpc.id)
-subnet2 = ec2.create_subnet(CidrBlock='192.168.1.0/24', VpcId=vpc.id)
+public_subnet_1 = client.create_subnet(CidrBlock='192.168.1.0/24', VpcId=vpc['Vpc']['VpcId'])
+private_subnet_1 = client.create_subnet(CidrBlock='192.168.1.0/24', VpcId=vpc['Vpc']['VpcId'])
+
+# create an Elastic IP address
+# Note if this elastic ip is not used it will incur charges
+eip = client.allocate_address(Domain='vpc',
+                              DryRun=True,
+                              TagSpecifications=[{
+                                  'ResourceType': 'elastic-ip',
+                                  'Tags': [{
+                                      'Key': 'Name',
+                                      'Value': 'my-eip-1'
+                                      }]
+                                  }]
+                              )
 
 # create NAT gateway in public subnet, allocate an EIP to the nat gateway
-ngw = ec2.create_nat_gateway(
-    AllocationId='string',
-    ClientToken='string',
-    DryRun=True|False,
-    SubnetId=subnet1.id,
+ngw = client.create_nat_gateway(
+    AllocationId=eip['PublicIp'],
+    DryRun=True,
+    SubnetId=public_subnet_1['Subnet']['SubnetId'],
+    TagSpecifications=[{
+        'ResourceType': 'natgateway',
+        'Tags': [{
+            'Key': 'Name',
+            'Value': 'nat-gate-way'
+            }]
+        }]
+    )
+
+# create a route table and a public route
+vpc_route_table = client.create_route_table(DryRun=True, VpcId=vpc.id)
+route = vpc_route_table.create_route(DestinationCidrBlock='0.0.0.0/0',
+                                     GatewayId=igw['InternetGateway']['InternetGatewayId'])
+
+private_route_table = client.create_route_table(DryRun=True, VpcId=vpc.id)
+route = private_route_table.create_route(DestinationCidrBlock='0.0.0.0/0',
+                                         NatGatewayId=ngw['NatGateway']['NatGatewayId'])
+
+# associate the route table with the subnet
+vpc_route_table.associate_with_subnet(SubnetId=public_subnet_1['Subnet']['SubnetId'])
+private_route_table.associate_with_subnet(SubnetId=private_subnet_1['Subnet']['SubnetId'])
+
+# Creating a security group
+sec_group = client.create_security_group(
+    Description='This security group allows outbound traffic to all ports, all protocols to any destination address',
+    GroupName='web-access',
+    VpcId=vpc['Vpc']['VpcId'],
+    TagSpecifications=[{
+            'ResourceType':'security-group',
+            'Tags': [{
+                    'Key': 'Name',
+                    'Value': 'web-access'
+                }]
+            }],
+    DryRun=True
+    )
+
+# creating the key pair
+key_pair = client.create_key_pair(
+    KeyName='my-key-pair',
+    DryRun=True,
+    KeyType='rsa',
     TagSpecifications=[
         {
-            'ResourceType': 'natgateway',
+            'ResourceType': 'key-pair',
             'Tags': [
                 {
                     'Key': 'Name',
-                    'Value': 'nat-gate-way'
+                    'Value': 'my-key-pair-ec2'
                 },
             ]
         },
     ],
-    ConnectivityType='public'
+    KeyFormat='pem'
 )
-# associate the route table with the subnet
-route_table.associate_with_subnet(SubnetId=subnet.id)
 
-# Create sec group
-sec_group = ec2.create_security_group(
-    GroupName='slice_0', Description='slice_0 sec group', VpcId=vpc.id)
-sec_group.authorize_ingress(
-    CidrIp='0.0.0.0/0',
-    IpProtocol='icmp',
-    FromPort=-1,
-    ToPort=-1
-)
-print(sec_group.id)
-
-# find image id ami-835b4efa / us-west-2
 # Create instance
-instances = ec2.create_instances(
-    ImageId='ami-835b4efa', InstanceType='t2.micro', MaxCount=1, MinCount=1,
-    NetworkInterfaces=[{'SubnetId': subnet.id, 'DeviceIndex': 0, 'AssociatePublicIpAddress': True, 'Groups': [sec_group.group_id]}])
-instances[0].wait_until_running()
-print(instances[0].id)
+# Amazon Linux 2 AMI (HVM) - Kernel 5.10, SSD Volume Type
+# ami-0cff7528ff583bf9a (64-bit (x86)) - us-east-1
+ec2_instance = client.run_instances(
+    ImageId='ami-0cff7528ff583bf9a',
+    InstanceType='t2.micro', 
+    MaxCount=1, 
+    MinCount=1,
+    KeyName='my-key-pair',
+    SecurityGroupIds=[sec_group['GroupId']],
+    SubnetId=private_subnet_1['Subnet']['SubnetId'],
+    DryRun=True
+    )
+ec2_instance[0].wait_until_running()
 
-# create a public subnet
-# create a private subnet
-# create NAT gateway in public subnet, allocate an EIP to the nat gateway
-# add nat-id to route table of private subnet
-# 
+ec2_info = ['OwnerId', 'RequesterId', 'ImageId',
+            'InstanceId','InstanceType', 'KeyName',
+            'LaunchTime','Monitoring', 'Platform',
+            'State', 'SubnetId','VpcId','Architecture']
+
+for _property in ec2_info:
+    print(f"{_property}\t {ec2_instance[_property]}\n")
