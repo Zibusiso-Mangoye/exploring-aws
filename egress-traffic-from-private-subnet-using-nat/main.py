@@ -1,28 +1,30 @@
+from time import sleep
 import boto3
 
 # Using default config profile
 client = boto3.client('ec2')
 
 # create VPC and assign a name to vpc using tags
+
 vpc = client.create_vpc(CidrBlock='192.168.0.0/16')
-vpc.create_tags(Tags=[{"Key": "Name", 
+client.create_tags(Resources=[vpc['Vpc']['VpcId']],
+                   Tags=[{"Key": "Name", 
                        "Value": "my_vpc"
                        }]
                 )
-vpc.wait_until_available()
 
-# create and attach internet gateway to the vpc
+# create and attach internet gateway to the vpc 
 igw = client.create_internet_gateway()
-vpc.attach_internet_gateway(InternetGatewayId=igw['InternetGateway']['InternetGatewayId']) 
+client.attach_internet_gateway(InternetGatewayId=igw['InternetGateway']['InternetGatewayId'],
+                               VpcId=vpc['Vpc']['VpcId']) 
 
 # create subnet
-public_subnet_1 = client.create_subnet(CidrBlock='192.168.1.0/24', VpcId=vpc['Vpc']['VpcId'])
-private_subnet_1 = client.create_subnet(CidrBlock='192.168.1.0/24', VpcId=vpc['Vpc']['VpcId'])
+public_subnet_1 = client.create_subnet(CidrBlock='192.168.0.0/24', VpcId=vpc['Vpc']['VpcId'])
+private_subnet_1 = client.create_subnet(CidrBlock='192.168.128.0/24', VpcId=vpc['Vpc']['VpcId'])
 
 # create an Elastic IP address
 # Note if this elastic ip is not used it will incur charges
 eip = client.allocate_address(Domain='vpc',
-                              DryRun=True,
                               TagSpecifications=[{
                                   'ResourceType': 'elastic-ip',
                                   'Tags': [{
@@ -34,8 +36,7 @@ eip = client.allocate_address(Domain='vpc',
 
 # create NAT gateway in public subnet, allocate an EIP to the nat gateway
 ngw = client.create_nat_gateway(
-    AllocationId=eip['PublicIp'],
-    DryRun=True,
+    AllocationId=eip['AllocationId'],
     SubnetId=public_subnet_1['Subnet']['SubnetId'],
     TagSpecifications=[{
         'ResourceType': 'natgateway',
@@ -46,18 +47,27 @@ ngw = client.create_nat_gateway(
         }]
     )
 
-# create a route table and a public route
-vpc_route_table = client.create_route_table(DryRun=True, VpcId=vpc.id)
-route = vpc_route_table.create_route(DestinationCidrBlock='0.0.0.0/0',
-                                     GatewayId=igw['InternetGateway']['InternetGatewayId'])
+print('waiting for nat gateway creation')
+sleep(180) # waiting for nat gateway to be available
+print(f"state of nat gateway is : {ngw['NatGateway']['State']}")
 
-private_route_table = client.create_route_table(DryRun=True, VpcId=vpc.id)
-route = private_route_table.create_route(DestinationCidrBlock='0.0.0.0/0',
-                                         NatGatewayId=ngw['NatGateway']['NatGatewayId'])
+
+# create a route table and a public route
+vpc_route_table = client.create_route_table(VpcId=vpc['Vpc']['VpcId'])
+route = client.create_route(DestinationCidrBlock='0.0.0.0/0',
+                            GatewayId=igw['InternetGateway']['InternetGatewayId'],
+                            RouteTableId=vpc_route_table['RouteTable']['RouteTableId'])
+
+private_route_table = client.create_route_table(VpcId=vpc['Vpc']['VpcId'])
+route = client.create_route(DestinationCidrBlock='0.0.0.0/0',
+                            NatGatewayId=ngw['NatGateway']['NatGatewayId'],
+                            RouteTableId=private_route_table['RouteTable']['RouteTableId'])
 
 # associate the route table with the subnet
-vpc_route_table.associate_with_subnet(SubnetId=public_subnet_1['Subnet']['SubnetId'])
-private_route_table.associate_with_subnet(SubnetId=private_subnet_1['Subnet']['SubnetId'])
+client.associate_route_table(RouteTableId=vpc_route_table['RouteTable']['RouteTableId'],
+                             SubnetId=public_subnet_1['Subnet']['SubnetId'])
+client.associate_route_table(RouteTableId=private_route_table['RouteTable']['RouteTableId'],
+                             SubnetId=private_subnet_1['Subnet']['SubnetId'])
 
 # Creating a security group
 sec_group = client.create_security_group(
@@ -70,14 +80,12 @@ sec_group = client.create_security_group(
                     'Key': 'Name',
                     'Value': 'web-access'
                 }]
-            }],
-    DryRun=True
+            }]
     )
 
 # creating the key pair
 key_pair = client.create_key_pair(
     KeyName='my-key-pair',
-    DryRun=True,
     KeyType='rsa',
     TagSpecifications=[
         {
@@ -104,14 +112,13 @@ ec2_instance = client.run_instances(
     KeyName='my-key-pair',
     SecurityGroupIds=[sec_group['GroupId']],
     SubnetId=private_subnet_1['Subnet']['SubnetId'],
-    DryRun=True
     )
-ec2_instance[0].wait_until_running()
+print('now waiting for ec2 instance')
+sleep(180) # waiting for nat gateway to be available
 
-ec2_info = ['OwnerId', 'RequesterId', 'ImageId',
-            'InstanceId','InstanceType', 'KeyName',
+ec2_info = ['ImageId', 'InstanceId','InstanceType', 'KeyName',
             'LaunchTime','Monitoring', 'Platform',
             'State', 'SubnetId','VpcId','Architecture']
 
 for _property in ec2_info:
-    print(f"{_property}\t {ec2_instance[_property]}\n")
+    print(f"{_property}\t {ec2_instance['Instances'][0][_property]}\n")
